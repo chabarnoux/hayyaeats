@@ -6,6 +6,7 @@ set -euo pipefail
 # Subdomains: api.hayyaeats.com, admin.hayyaeats.com, restaurant.hayyaeats.com
 # Timezone: America/Toronto
 # NOTE: Credentials are weak for speed. Complete install first, harden later.
+# Zip sources (as provided): /var/www/hayyaeats/*.zip
 
 if [[ ${EUID:-$(id -u)} -ne 0 ]]; then
   echo "Please run as root (use sudo)." >&2
@@ -53,10 +54,10 @@ ufw --force enable || true
 # 2) DATABASE (weak creds for speed)
 # ---------------------------------------------------------------------
 log "Configuring MySQL users and database..."
-mysql -e "ALTER USER 'root'@'localhost' IDENTIFIED WITH mysql_native_password BY 'TempRoot123!'; FLUSH PRIVILEGES;" || true
-mysql -uroot -pTempRoot123! -e "CREATE DATABASE IF NOT EXISTS stackfood DEFAULT CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci;"
-mysql -uroot -pTempRoot123! -e "CREATE USER IF NOT EXISTS 'stackfood'@'localhost' IDENTIFIED BY 'TempDB123!';"
-mysql -uroot -pTempRoot123! -e "GRANT ALL PRIVILEGES ON stackfood.* TO 'stackfood'@'localhost'; FLUSH PRIVILEGES;"
+mysql -e "ALTER USER 'root'@'localhost' IDENTIFIED WITH mysql_native_password BY 'HayyaRoot123!'; FLUSH PRIVILEGES;" || true
+mysql -uroot -pHayyaRoot123! -e "CREATE DATABASE IF NOT EXISTS stackfood DEFAULT CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci;"
+mysql -uroot -pHayyaRoot123! -e "CREATE USER IF NOT EXISTS 'stackfood'@'localhost' IDENTIFIED BY 'HayyaDb123!';"
+mysql -uroot -pHayyaRoot123! -e "GRANT ALL PRIVILEGES ON stackfood.* TO 'stackfood'@'localhost'; FLUSH PRIVILEGES;"
 
 # ---------------------------------------------------------------------
 # 3) BACKEND DEPLOY
@@ -65,27 +66,46 @@ log "Preparing backend directory..."
 su -s /bin/bash -c "mkdir -p /var/www/stackfood" deploy
 cd /var/www/stackfood
 
-if [[ ! -f "/var/www/stackfood/stackfood-backend.zip" ]]; then
-  echo "Missing /var/www/stackfood/stackfood-backend.zip. Upload your Laravel backend zip with this exact name, then rerun." >&2
+BACKEND_STAGE=/var/www/hayyaeats/extracted-main
+rm -rf "$BACKEND_STAGE"
+mkdir -p "$BACKEND_STAGE"
+
+# Detect main StackFood package zip (prefer the one with laravel admin in name)
+MAIN_ZIP="$(ls -1 /var/www/hayyaeats/*laravel-admin* 2>/dev/null | head -n1)"
+if [[ -z "${MAIN_ZIP}" ]]; then
+  MAIN_ZIP="$(ls -S /var/www/hayyaeats/*.zip 2>/dev/null | head -n1)"
+fi
+if [[ -z "${MAIN_ZIP}" || ! -f "${MAIN_ZIP}" ]]; then
+  echo "Missing StackFood main zip under /var/www/hayyaeats. Place the large codecanyon zip there and rerun." >&2
   exit 1
 fi
 
-log "Unzipping backend release..."
-su -s /bin/bash -c "unzip -o /var/www/stackfood/stackfood-backend.zip -d /var/www/stackfood/release" deploy
+log "Unzipping main package: ${MAIN_ZIP} ..."
+unzip -o "${MAIN_ZIP}" -d "$BACKEND_STAGE" >/dev/null
+
+# Find Laravel backend source (directory containing artisan)
+BACKEND_SRC="$(dirname "$(find "$BACKEND_STAGE" -maxdepth 5 -type f -name artisan 2>/dev/null | head -n1)")"
+if [[ -z "${BACKEND_SRC}" || ! -f "${BACKEND_SRC}/artisan" ]]; then
+  echo "Could not detect Laravel backend inside ${MAIN_ZIP}. Please check package structure." >&2
+  exit 1
+fi
+
+log "Syncing backend to /var/www/stackfood/release ..."
+mkdir -p /var/www/stackfood/release
+shopt -s dotglob
+rm -rf /var/www/stackfood/release/*
+cp -a "${BACKEND_SRC}/"* /var/www/stackfood/release/
+shopt -u dotglob
 cd /var/www/stackfood/release
 
 log "Installing PHP dependencies..."
 su -s /bin/bash -c "composer install --no-dev --prefer-dist --optimize-autoloader" deploy
 
-log "Setting up environment..."
-su -s /bin/bash -c "cp -n .env.example .env || true" deploy
-su -s /bin/bash -c "php artisan key:generate" deploy || true
-
-log "Writing minimal .env..."
+log "Writing .env (prefilled weak creds)..."
 cat > /var/www/stackfood/release/.env <<'ENV'
 APP_NAME="HayyaEats"
 APP_ENV=production
-APP_KEY=base64:REPLACED_BY_KEY_GENERATE
+APP_KEY=
 APP_DEBUG=false
 APP_URL=https://api.hayyaeats.com
 APP_TIMEZONE=America/Toronto
@@ -98,7 +118,7 @@ DB_HOST=127.0.0.1
 DB_PORT=3306
 DB_DATABASE=stackfood
 DB_USERNAME=stackfood
-DB_PASSWORD=TempDB123!
+DB_PASSWORD=HayyaDb123!
 
 CACHE_DRIVER=redis
 QUEUE_CONNECTION=redis
@@ -107,25 +127,32 @@ REDIS_HOST=127.0.0.1
 REDIS_PASSWORD=null
 REDIS_PORT=6379
 
-FILESYSTEM_DISK=public
-
 MAIL_MAILER=smtp
 MAIL_HOST=smtp.sendgrid.net
 MAIL_PORT=587
 MAIL_USERNAME=apikey
-MAIL_PASSWORD=TempMail123!
+MAIL_PASSWORD=SG.fake-quick-setup
 MAIL_ENCRYPTION=tls
 MAIL_FROM_ADDRESS=noreply@hayyaeats.com
 MAIL_FROM_NAME="HayyaEats"
 
-GOOGLE_MAPS_KEY=
-FCM_SERVER_KEY=
-FCM_SENDER_ID=
-STRIPE_KEY=
-STRIPE_SECRET=
+FILESYSTEM_DISK=public
 
+# Dummy API keys for speed; replace after install
+GOOGLE_MAPS_KEY=FAKE-GMAPS-KEY
+FCM_SERVER_KEY=FAKE-FCM-KEY
+FCM_SENDER_ID=1234567890
+STRIPE_KEY=pk_test_fake
+STRIPE_SECRET=sk_test_fake
+
+# Allow admin/restaurant origins
 CORS_ALLOWED_ORIGINS=https://admin.hayyaeats.com,https://restaurant.hayyaeats.com
 ENV
+
+chown deploy:www-data /var/www/stackfood/release/.env
+
+log "Generating APP_KEY..."
+su -s /bin/bash -c "php artisan key:generate" deploy || true
 
 # ---------------------------------------------------------------------
 # 5) MIGRATIONS & OPTIMIZATION
@@ -247,9 +274,28 @@ apt -y install openjdk-17-jdk || true
 mkdir -p /var/www/apps
 cd /var/www/apps
 
+# Map provided zips if present under /var/www/hayyaeats
+RESTA_ZIP=$(ls -1 /var/www/hayyaeats/*restaurant-app*v10.zip 2>/dev/null | head -n1 || true)
+DELIV_ZIP=$(ls -1 /var/www/hayyaeats/*delivery*app*v10.zip 2>/dev/null | head -n1 || true)
+USER_ZIP=$(ls -1 /var/www/hayyaeats/*user*app*v10.zip 2>/dev/null | head -n1 || true)
+
+if [[ -n "${USER_ZIP}" && -f "${USER_ZIP}" ]]; then
+  cp -f "${USER_ZIP}" /var/www/apps/user-app.zip
+fi
+if [[ -n "${RESTA_ZIP}" && -f "${RESTA_ZIP}" ]]; then
+  cp -f "${RESTA_ZIP}" /var/www/apps/restaurant-app.zip
+fi
+if [[ -n "${DELIV_ZIP}" && -f "${DELIV_ZIP}" ]]; then
+  cp -f "${DELIV_ZIP}" /var/www/apps/delivery-app.zip
+fi
+
 if [[ -f "/var/www/apps/user-app.zip" ]]; then
   log "Building USER app..."
-  su -s /bin/bash -c "unzip -o /var/www/apps/user-app.zip -d /var/www/apps/user-app" deploy
+  su -s /bin/bash -c "unzip -o /var/www/apps/user-app.zip -d /var/www/apps/_user-extract" deploy
+  USER_DIR="$(find /var/www/apps/_user-extract -maxdepth 3 -name pubspec.yaml -exec dirname {} \; | head -n1)"
+  if [[ -n "${USER_DIR}" ]]; then
+    rm -rf /var/www/apps/user-app && mv "${USER_DIR}" /var/www/apps/user-app
+  fi
   if [[ -f "/var/www/apps/user-app/lib/util/app_constants.dart" ]]; then
     su -s /bin/bash -c "sed -i 's#baseUrl *= *\"[^\"]*\"#baseUrl = \"https://api.hayyaeats.com\"#' /var/www/apps/user-app/lib/util/app_constants.dart" deploy || true
   fi
@@ -271,7 +317,11 @@ fi
 
 if [[ -f "/var/www/apps/restaurant-app.zip" ]]; then
   log "Building RESTAURANT app..."
-  su -s /bin/bash -c "unzip -o /var/www/apps/restaurant-app.zip -d /var/www/apps/restaurant-app" deploy
+  su -s /bin/bash -c "unzip -o /var/www/apps/restaurant-app.zip -d /var/www/apps/_restaurant-extract" deploy
+  RESTA_DIR="$(find /var/www/apps/_restaurant-extract -maxdepth 3 -name pubspec.yaml -exec dirname {} \; | head -n1)"
+  if [[ -n "${RESTA_DIR}" ]]; then
+    rm -rf /var/www/apps/restaurant-app && mv "${RESTA_DIR}" /var/www/apps/restaurant-app
+  fi
   if [[ -f "/var/www/apps/restaurant-app/lib/util/app_constants.dart" ]]; then
     su -s /bin/bash -c "sed -i 's#baseUrl *= *\"[^\"]*\"#baseUrl = \"https://api.hayyaeats.com\"#' /var/www/apps/restaurant-app/lib/util/app_constants.dart" deploy || true
   fi
@@ -293,7 +343,11 @@ fi
 
 if [[ -f "/var/www/apps/delivery-app.zip" ]]; then
   log "Building DELIVERY app..."
-  su -s /bin/bash -c "unzip -o /var/www/apps/delivery-app.zip -d /var/www/apps/delivery-app" deploy
+  su -s /bin/bash -c "unzip -o /var/www/apps/delivery-app.zip -d /var/www/apps/_delivery-extract" deploy
+  DELIV_DIR="$(find /var/www/apps/_delivery-extract -maxdepth 3 -name pubspec.yaml -exec dirname {} \; | head -n1)"
+  if [[ -n "${DELIV_DIR}" ]]; then
+    rm -rf /var/www/apps/delivery-app && mv "${DELIV_DIR}" /var/www/apps/delivery-app
+  fi
   if [[ -f "/var/www/apps/delivery-app/lib/util/app_constants.dart" ]]; then
     su -s /bin/bash -c "sed -i 's#baseUrl *= *\"[^\"]*\"#baseUrl = \"https://api.hayyaeats.com\"#' /var/www/apps/delivery-app/lib/util/app_constants.dart" deploy || true
   fi
@@ -312,6 +366,24 @@ EOF
   cp -f build/app/outputs/bundle/release/app-release.aab /var/www/builds/delivery/ 2>/dev/null || true
   cp -f build/app/outputs/flutter-apk/app-release.apk /var/www/builds/delivery/ 2>/dev/null || true
 fi
+
+# ---------------------------------------------------------------------
+# 9) BACKUPS (simple rotation)
+# ---------------------------------------------------------------------
+log "Configuring backups and rotation..."
+mkdir -p /opt/backups && chown deploy:www-data /opt/backups
+cat <<'SH' > /usr/local/bin/backup_stackfood.sh
+#!/usr/bin/env bash
+set -e
+STAMP=$(date +"%Y%m%d-%H%M%S")
+mkdir -p /opt/backups/$STAMP
+mysqldump -ustackfood -p'HayyaDb123!' stackfood > /opt/backups/$STAMP/stackfood.sql
+cp /var/www/stackfood/release/.env /opt/backups/$STAMP/.env
+tar -czf /opt/backups/$STAMP-storage.tar.gz -C /var/www/stackfood/release storage/app/public
+find /opt/backups -type d -mtime +14 -exec rm -rf {} \; 2>/dev/null || true
+SH
+chmod +x /usr/local/bin/backup_stackfood.sh
+( crontab -l 2>/dev/null; echo "30 2 * * * /usr/local/bin/backup_stackfood.sh" ) | crontab -u deploy -
 
 # ---------------------------------------------------------------------
 # 10) QUICK SECURITY/HEALTH (minimal)
